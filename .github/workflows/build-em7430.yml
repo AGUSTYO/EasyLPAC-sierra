@@ -1,0 +1,41 @@
+name: build-em7430
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [em7430]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Terapkan patch
+        run: |
+          python3 patch_em7430.py
+          python3 add_debug.py
+
+      - name: Cek format dan kompilasi
+        run: |
+          gofmt -l internal/
+          go vet ./internal/atclient/
+
+      - name: Build Windows
+        env:
+          GOOS: windows
+          GOARCH: amd64
+          CGO_ENABLED: "0"
+        run: |
+          mkdir -p out
+          go build -o out/ ./...
+          ls -la out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lpac-em7430-windows
+          path: out/
