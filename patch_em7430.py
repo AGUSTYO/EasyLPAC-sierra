@@ -1,177 +1,222 @@
-target = "third_party/lpac/driver/apdu/at_etsi.c"
+target = "internal/atclient/atclient.go"
 
 with open(target, "r", encoding="utf-8") as f:
     src = f.read()
 
-old_func = """static int apdu_interface_transmit(struct euicc_ctx *ctx, uint8_t **rx, uint32_t *rx_len, const uint8_t *tx,
-                                   const uint32_t tx_len) {
-    struct at_userdata *userdata = ctx->apdu.interface->userdata;
-    const char *logic_channel = at_channel_get(userdata, ctx->apdu._internal.logic_channel);
+old_method = """// CommandWithTimeout is Command with a per-call final-response timeout,
+// used for data commands (APDU execution) that may legitimately take
+// longer than control commands.
+func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout time.Duration) (*Result, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-    int fret = 0;
-    char *response = NULL;
+	if c.closed {
+		return nil, errors.New("atclient: client closed")
+	}
+	if c.invalid != nil {
+		return nil, fmt.Errorf("%w: %v", ErrDesynchronized, c.invalid)
+	}
 
-    int ret;
-    char *encoded = NULL;
+	if _, err := c.port.Write([]byte(cmd + "\\r")); err != nil {
+		return c.fail("write: %v", err)
+	}
 
-    *rx = NULL;
-    *rx_len = 0;
+	if timeout <= 0 {
+		timeout = c.opts.Timeout
+	}
+	deadline := time.Now().Add(timeout)
+	res := &Result{}
+	buf := make([]byte, readChunk)
 
-    encoded = malloc(tx_len * 2 + 1);
-    euicc_hexutil_bin2hex(encoded, tx_len * 2 + 1, tx, tx_len);
+	for {
+		if time.Now().After(deadline) {
+			return c.fail("timeout waiting for final response to %q", cmd)
+		}
+		n, err := c.port.Read(buf)
+		if err != nil {
+			if isTimeout(err) {
+				continue
+			}
+			return c.fail("read: %v", err)
+		}
 
-    at_emit_command(userdata, "AT+CGLA=%s,%u,\\"%s\\"", logic_channel, tx_len * 2, encoded);
-    if (at_expect(userdata, &response, "+CGLA: ") != 0 || response == NULL)
-        goto err;
-
-    strtok(response, ",");        // Skip length
-    response = strtok(NULL, ","); // Get response
-    size_t n = strlen(response);
-    if (response[0] == '"' && response[n - 1] == '"') {
-        memmove(response, response + 1, n - 2);
-        response[n - 2] = '\\0';
-    }
-
-    *rx_len = strlen(response) / 2;
-    *rx = malloc(*rx_len);
-    if (*rx == NULL)
-        goto err;
-    ret = euicc_hexutil_hex2bin_r(*rx, *rx_len, response, strlen(response));
-    if (ret < 0)
-        goto err;
-    *rx_len = ret;
-
-    goto exit;
-
-err:
-    fret = -1;
-    free(*rx);
-    *rx = NULL;
-    *rx_len = 0;
-exit:
-    free(encoded);
-    return fret;
+		lines := c.appendAndSplit(buf[:n])
+		if c.invalid != nil {
+			return nil, c.invalid
+		}
+		for _, line := range lines {
+			switch {
+			case line == "" || line == cmd: // empty line or echo
+			case line == "OK":
+				return res, nil
+			case line == "ERROR":
+				return nil, errors.New("atclient: modem returned ERROR")
+			case strings.HasPrefix(line, "+CME ERROR:"), strings.HasPrefix(line, "+CMS ERROR:"):
+				return nil, fmt.Errorf("atclient: modem returned %s", line)
+			case expectPrefix != "" && strings.HasPrefix(line, expectPrefix):
+				res.Value = unquote(strings.TrimSpace(strings.TrimPrefix(line, expectPrefix)))
+			case strings.HasPrefix(line, "+"):
+				res.URCs = append(res.URCs, line)
+				if c.opts.URC != nil {
+					c.opts.URC(line)
+				}
+			default:
+				// Non-standard informational line; keep as diagnostic.
+				res.URCs = append(res.URCs, line)
+			}
+		}
+	}
 }"""
 
-new_func = """static int apdu_interface_transmit(struct euicc_ctx *ctx, uint8_t **rx, uint32_t *rx_len, const uint8_t *tx,
-                                   const uint32_t tx_len) {
-    struct at_userdata *userdata = ctx->apdu.interface->userdata;
-    const char *logic_channel = at_channel_get(userdata, ctx->apdu._internal.logic_channel);
+new_method = """func (c *Client) execSingleCommand(cmd string, expectPrefix string, timeout time.Duration) (*Result, error) {
+	if _, err := c.port.Write([]byte(cmd + "\\r")); err != nil {
+		return c.fail("write: %v", err)
+	}
 
-    int fret = 0;
-    char *response = NULL;
-    char *encoded = NULL;
-    uint8_t *fixed_tx = NULL;
-    uint8_t *total_buf = NULL;
-    uint32_t total_len = 0;
-    uint32_t total_cap = 4096;
+	if timeout <= 0 {
+		timeout = c.opts.Timeout
+	}
+	deadline := time.Now().Add(timeout)
+	res := &Result{}
+	buf := make([]byte, readChunk)
 
-    *rx = NULL;
-    *rx_len = 0;
+	for {
+		if time.Now().After(deadline) {
+			return c.fail("timeout waiting for final response to %q", cmd)
+		}
+		n, err := c.port.Read(buf)
+		if err != nil {
+			if isTimeout(err) {
+				continue
+			}
+			return c.fail("read: %v", err)
+		}
 
-    fixed_tx = malloc(tx_len + 2);
-    total_buf = malloc(total_cap);
-    if (!fixed_tx || !total_buf)
-        goto err;
+		lines := c.appendAndSplit(buf[:n])
+		if c.invalid != nil {
+			return nil, c.invalid
+		}
+		for _, line := range lines {
+			switch {
+			case line == "" || line == cmd:
+			case line == "OK":
+				return res, nil
+			case line == "ERROR":
+				return nil, errors.New("atclient: modem returned ERROR")
+			case strings.HasPrefix(line, "+CME ERROR:"), strings.HasPrefix(line, "+CMS ERROR:"):
+				return nil, fmt.Errorf("atclient: modem returned %s", line)
+			case expectPrefix != "" && strings.HasPrefix(line, expectPrefix):
+				res.Value = unquote(strings.TrimSpace(strings.TrimPrefix(line, expectPrefix)))
+			case strings.HasPrefix(line, "+"):
+				res.URCs = append(res.URCs, line)
+				if c.opts.URC != nil {
+					c.opts.URC(line)
+				}
+			default:
+				res.URCs = append(res.URCs, line)
+			}
+		}
+	}
+}
 
-    memcpy(fixed_tx, tx, tx_len);
-    uint32_t fixed_len = tx_len;
-    if (tx_len > 5 && tx_len == (uint32_t)(5 + tx[4])) {
-        fixed_tx[fixed_len++] = 0x00;
-    }
+func fixSierraCGLA(cmd string) (newCmd string, handle string, getRespCLA string, isCGLA bool) {
+	upper := strings.ToUpper(cmd)
+	if !strings.HasPrefix(upper, "AT+CGLA=") {
+		return cmd, "", "", false
+	}
+	rest := cmd[len("AT+CGLA="):]
+	p1 := strings.IndexByte(rest, ',')
+	if p1 < 0 {
+		return cmd, "", "", false
+	}
+	handle = strings.TrimSpace(rest[:p1])
+	rest2 := rest[p1+1:]
+	p2 := strings.IndexByte(rest2, ',')
+	if p2 < 0 {
+		return cmd, "", "", false
+	}
+	apduHex := unquote(strings.TrimSpace(rest2[p2+1:]))
+	byteLen := len(apduHex) / 2
+	if byteLen > 5 {
+		if lc, err := strconv.ParseInt(apduHex[8:10], 16, 32); err == nil {
+			if byteLen == 5+int(lc) {
+				apduHex += "00"
+			}
+		}
+	}
+	if len(apduHex) >= 2 {
+		if claByte, err := strconv.ParseUint(apduHex[0:2], 16, 8); err == nil {
+			getRespCLA = fmt.Sprintf("%02x", claByte&0x03)
+		}
+	}
+	newCmd = fmt.Sprintf("AT+CGLA=%s,%d,\\"%s\\"", handle, len(apduHex), apduHex)
+	return newCmd, handle, getRespCLA, true
+}
 
-    uint8_t get_resp_cla = fixed_tx[0] & 0x03;
-    uint8_t get_resp_cmd[5];
-    const uint8_t *cur_tx = fixed_tx;
-    uint32_t cur_tx_len = fixed_len;
+// CommandWithTimeout is Command with a per-call final-response timeout,
+// used for data commands (APDU execution) that may legitimately take
+// longer than control commands.
+func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout time.Duration) (*Result, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-    while (1) {
-        free(encoded);
-        encoded = malloc(cur_tx_len * 2 + 1);
-        if (!encoded)
-            goto err;
-        euicc_hexutil_bin2hex(encoded, cur_tx_len * 2 + 1, cur_tx, cur_tx_len);
+	if c.closed {
+		return nil, errors.New("atclient: client closed")
+	}
+	if c.invalid != nil {
+		return nil, fmt.Errorf("%w: %v", ErrDesynchronized, c.invalid)
+	}
 
-        free(response);
-        response = NULL;
-        at_emit_command(userdata, "AT+CGLA=%s,%u,\\"%s\\"", logic_channel, cur_tx_len * 2, encoded);
-        if (at_expect(userdata, &response, "+CGLA: ") != 0 || response == NULL)
-            goto err;
+	fixedCmd, handle, getRespCLA, isCGLA := fixSierraCGLA(cmd)
+	if !isCGLA {
+		return c.execSingleCommand(cmd, expectPrefix, timeout)
+	}
 
-        strtok(response, ",");
-        char *hex_part = strtok(NULL, ",");
-        if (!hex_part)
-            goto err;
-        size_t n = strlen(hex_part);
-        if (n >= 2 && hex_part[0] == '"' && hex_part[n - 1] == '"') {
-            memmove(hex_part, hex_part + 1, n - 2);
-            hex_part[n - 2] = '\\0';
-        }
+	res, err := c.execSingleCommand(fixedCmd, expectPrefix, timeout)
+	if err != nil || res == nil {
+		return res, err
+	}
 
-        uint32_t chunk_cap = (uint32_t)(strlen(hex_part) / 2);
-        uint8_t *chunk_bin = malloc(chunk_cap + 1);
-        if (!chunk_bin)
-            goto err;
-        int chunk_len = euicc_hexutil_hex2bin_r(chunk_bin, chunk_cap, hex_part, strlen(hex_part));
-        if (chunk_len < 2) {
-            free(chunk_bin);
-            goto err;
-        }
+	var fullData strings.Builder
+	curRes := res
+	for {
+		declared, hexPart, ok := strings.Cut(curRes.Value, ",")
+		if !ok {
+			return curRes, nil
+		}
+		_ = declared
+		hexPart = unquote(strings.TrimSpace(hexPart))
+		if len(hexPart) < 4 {
+			return curRes, nil
+		}
+		sw1 := strings.ToUpper(hexPart[len(hexPart)-4 : len(hexPart)-2])
+		sw2 := strings.ToUpper(hexPart[len(hexPart)-2:])
+		fullData.WriteString(hexPart[:len(hexPart)-4])
 
-        uint8_t sw1 = chunk_bin[chunk_len - 2];
-        uint8_t sw2 = chunk_bin[chunk_len - 1];
-        uint32_t body_len = (uint32_t)(chunk_len - 2);
-
-        if (total_len + body_len + 2 > total_cap) {
-            total_cap = (total_len + body_len + 2) * 2;
-            uint8_t *nb = realloc(total_buf, total_cap);
-            if (!nb) {
-                free(chunk_bin);
-                goto err;
-            }
-            total_buf = nb;
-        }
-
-        memcpy(total_buf + total_len, chunk_bin, body_len);
-        total_len += body_len;
-        free(chunk_bin);
-
-        if (sw1 == 0x61) {
-            get_resp_cmd[0] = get_resp_cla;
-            get_resp_cmd[1] = 0xC0;
-            get_resp_cmd[2] = 0x00;
-            get_resp_cmd[3] = 0x00;
-            get_resp_cmd[4] = sw2;
-            cur_tx = get_resp_cmd;
-            cur_tx_len = 5;
-        } else {
-            total_buf[total_len++] = sw1;
-            total_buf[total_len++] = sw2;
-            break;
-        }
-    }
-
-    *rx = total_buf;
-    *rx_len = total_len;
-    total_buf = NULL;
-    goto exit;
-
-err:
-    fret = -1;
-    free(total_buf);
-    *rx = NULL;
-    *rx_len = 0;
-exit:
-    free(response);
-    free(encoded);
-    free(fixed_tx);
-    return fret;
+		if sw1 == "61" && getRespCLA != "" {
+			getRespAPDU := fmt.Sprintf("%sc00000%s", getRespCLA, strings.ToLower(sw2))
+			nextCmd := fmt.Sprintf("AT+CGLA=%s,10,\\"%s\\"", handle, getRespAPDU)
+			nextRes, nextErr := c.execSingleCommand(nextCmd, expectPrefix, timeout)
+			if nextErr != nil {
+				return nextRes, nextErr
+			}
+			curRes.URCs = append(curRes.URCs, nextRes.URCs...)
+			curRes = nextRes
+		} else {
+			fullData.WriteString(sw1)
+			fullData.WriteString(sw2)
+			combined := fullData.String()
+			curRes.Value = fmt.Sprintf("%d,\\"%s\\"", len(combined), combined)
+			return curRes, nil
+		}
+	}
 }"""
 
-assert old_func in src, "Blok apdu_interface_transmit tidak cocok!"
-src = src.replace(old_func, new_func, 1)
+assert old_method in src, "Blok CommandWithTimeout tidak cocok!"
+src = src.replace('"strings"', '"strconv"\n\t"strings"', 1)
+src = src.replace(old_method, new_method, 1)
 
 with open(target, "w", encoding="utf-8") as f:
     f.write(src)
 
-print("Sukses mem-patch third_party/lpac/driver/apdu/at_etsi.c untuk Sierra EM7430!")
+print("Sukses mem-patch internal/atclient/atclient.go untuk Sierra EM7430!")
