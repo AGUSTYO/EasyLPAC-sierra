@@ -119,7 +119,7 @@ new_method = """func (c *Client) execSingleCommand(cmd string, expectPrefix stri
 	}
 }
 
-func fixSierraCGLA(cmd string) (newCmd string, handle string, getRespCLA string, isCGLA bool) {
+func normalizeCGLA(cmd string) (newCmd string, handle string, getRespCLA string, isCGLA bool) {
 	upper := strings.ToUpper(cmd)
 	if !strings.HasPrefix(upper, "AT+CGLA=") {
 		return cmd, "", "", false
@@ -153,9 +153,6 @@ func fixSierraCGLA(cmd string) (newCmd string, handle string, getRespCLA string,
 	return newCmd, handle, getRespCLA, true
 }
 
-// CommandWithTimeout is Command with a per-call final-response timeout,
-// used for data commands (APDU execution) that may legitimately take
-// longer than control commands.
 func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout time.Duration) (*Result, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -167,7 +164,7 @@ func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout tim
 		return nil, fmt.Errorf("%w: %v", ErrDesynchronized, c.invalid)
 	}
 
-	fixedCmd, handle, getRespCLA, isCGLA := fixSierraCGLA(cmd)
+	fixedCmd, handle, getRespCLA, isCGLA := normalizeCGLA(cmd)
 	if !isCGLA {
 		return c.execSingleCommand(cmd, expectPrefix, timeout)
 	}
@@ -180,11 +177,10 @@ func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout tim
 	var fullData strings.Builder
 	curRes := res
 	for {
-		declared, hexPart, ok := strings.Cut(curRes.Value, ",")
+		_, hexPart, ok := strings.Cut(curRes.Value, ",")
 		if !ok {
 			return curRes, nil
 		}
-		_ = declared
 		hexPart = unquote(strings.TrimSpace(hexPart))
 		if len(hexPart) < 4 {
 			return curRes, nil
@@ -200,7 +196,7 @@ func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout tim
 			if nextErr != nil {
 				return nextRes, nextErr
 			}
-			curRes.URCs = append(curRes.URCs, nextRes.URCs...)
+			nextRes.URCs = append(curRes.URCs, nextRes.URCs...)
 			curRes = nextRes
 		} else {
 			fullData.WriteString(sw1)
@@ -213,10 +209,11 @@ func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout tim
 }"""
 
 assert old_method in src, "Blok CommandWithTimeout tidak cocok!"
-src = src.replace('"strings"', '"strconv"\n\t"strings"', 1)
+if '"strconv"' not in src:
+    src = src.replace('"strings"', '"strconv"\n\t"strings"', 1)
 src = src.replace(old_method, new_method, 1)
 
 with open(target, "w", encoding="utf-8") as f:
     f.write(src)
 
-print("Sukses mem-patch internal/atclient/atclient.go untuk Sierra EM7430!")
+print("Patch ISO 7816-4 / Sierra EM7430 selesai diterapkan.")
