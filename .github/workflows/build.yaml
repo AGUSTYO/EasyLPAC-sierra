@@ -107,6 +107,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libpcsclite-dev
+      - name: Patch EM7430
+        run: python3 patch_em7430.py
       - name: Build libeuicc
         run: |
           ./scripts/build-libeuicc.sh linux/amd64
