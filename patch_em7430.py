@@ -1,12 +1,8 @@
-import shutil
-
 target = "internal/atclient/atclient.go"
-shutil.copyfile(target, target + ".bak")
 
 with open(target, "r", encoding="utf-8") as f:
     src = f.read()
 
-# 1. Tambah field realHandle di struct Client
 old_struct = r"""type Client struct {
 	port Port
 	opts Options
@@ -30,10 +26,9 @@ new_struct = r"""type Client struct {
 	invalid error
 }"""
 
-assert old_struct in src, "Blok struct Client tidak cocok! Cek spasi/indentasi di atclient.go"
+assert old_struct in src, "Blok struct Client tidak cocok!"
 src = src.replace(old_struct, new_struct, 1)
 
-# 2. Ganti CommandWithTimeout
 old_method = r"""// CommandWithTimeout is Command with a per-call final-response timeout,
 // used for data commands (APDU execution) that may legitimately take
 // longer than control commands.
@@ -150,9 +145,6 @@ new_method = r"""func (c *Client) execSingleCommand(cmd string, expectPrefix str
 	}
 }
 
-// normalizeCGLA menyiapkan AT+CGLA untuk modem yang butuh byte Le pada APDU
-// Case 4 dan session ID panjang. realHandle (jika ada) menggantikan handle
-// apa pun yang dikirim lapisan atas.
 func normalizeCGLA(cmd string, realHandle string) (newCmd string, handle string, getRespCLA string, isCGLA bool) {
 	upper := strings.ToUpper(cmd)
 	if !strings.HasPrefix(upper, "AT+CGLA=") {
@@ -190,9 +182,6 @@ func normalizeCGLA(cmd string, realHandle string) (newCmd string, handle string,
 	return newCmd, handle, getRespCLA, true
 }
 
-// CommandWithTimeout is Command with a per-call final-response timeout,
-// used for data commands (APDU execution) that may legitimately take
-// longer than control commands.
 func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout time.Duration) (*Result, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -206,7 +195,6 @@ func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout tim
 
 	upperCmd := strings.ToUpper(cmd)
 
-	// CCHO: simpan session ID asli dari modem, balasan tidak diubah.
 	if strings.HasPrefix(upperCmd, "AT+CCHO=") {
 		r, e := c.execSingleCommand(cmd, expectPrefix, timeout)
 		if e == nil && r != nil {
@@ -224,7 +212,6 @@ func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout tim
 		return r, e
 	}
 
-	// CCHC: pakai session ID asli, lalu lupakan.
 	if strings.HasPrefix(upperCmd, "AT+CCHC=") {
 		if c.realHandle != "" {
 			cmd = "AT+CCHC=" + c.realHandle
@@ -246,6 +233,7 @@ func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout tim
 
 	var fullData strings.Builder
 	curRes := res
+	got61 := false
 	for {
 		_, hexPart, ok := strings.Cut(curRes.Value, ",")
 		if !ok {
@@ -260,6 +248,7 @@ func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout tim
 		fullData.WriteString(hexPart[:len(hexPart)-4])
 
 		if sw1 == "61" && getRespCLA != "" {
+			got61 = true
 			getRespAPDU := fmt.Sprintf("%sc00000%s", getRespCLA, strings.ToLower(sw2))
 			nextCmd := fmt.Sprintf("AT+CGLA=%s,10,\"%s\"", handle, getRespAPDU)
 			nextRes, nextErr := c.execSingleCommand(nextCmd, expectPrefix, timeout)
@@ -269,6 +258,9 @@ func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout tim
 			nextRes.URCs = append(curRes.URCs, nextRes.URCs...)
 			curRes = nextRes
 		} else {
+			if !got61 {
+				return curRes, nil
+			}
 			fullData.WriteString(sw1)
 			fullData.WriteString(sw2)
 			combined := fullData.String()
@@ -278,7 +270,7 @@ func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout tim
 	}
 }"""
 
-assert old_method in src, "Blok CommandWithTimeout tidak cocok! File mungkin sudah dipatch atau berbeda versi."
+assert old_method in src, "Blok CommandWithTimeout tidak cocok!"
 if '"strconv"' not in src:
     src = src.replace('"strings"', '"strconv"\n\t"strings"', 1)
 src = src.replace(old_method, new_method, 1)
@@ -286,4 +278,4 @@ src = src.replace(old_method, new_method, 1)
 with open(target, "w", encoding="utf-8") as f:
     f.write(src)
 
-print("Patch selesai. Backup ada di", target + ".bak")
+print("Patch selesai diterapkan.")
