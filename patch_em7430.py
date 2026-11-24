@@ -3,32 +3,6 @@ target = "internal/atclient/atclient.go"
 with open(target, "r", encoding="utf-8") as f:
     src = f.read()
 
-old_struct = r"""type Client struct {
-	port Port
-	opts Options
-
-	mu     sync.Mutex
-	buf    []byte
-	closed bool
-	// invalid marks the stream unusable; reason keeps the cause.
-	invalid error
-}"""
-
-new_struct = r"""type Client struct {
-	port Port
-	opts Options
-
-	mu         sync.Mutex
-	buf        []byte
-	closed     bool
-	realHandle string
-	// invalid marks the stream unusable; reason keeps the cause.
-	invalid error
-}"""
-
-assert old_struct in src, "Blok struct Client tidak cocok!"
-src = src.replace(old_struct, new_struct, 1)
-
 old_method = r"""// CommandWithTimeout is Command with a per-call final-response timeout,
 // used for data commands (APDU execution) that may legitimately take
 // longer than control commands.
@@ -128,9 +102,9 @@ new_method = r"""func (c *Client) execSingleCommand(cmd string, expectPrefix str
 			case line == "OK":
 				return res, nil
 			case line == "ERROR":
-				return nil, errors.New("atclient: modem returned ERROR")
+				return nil, fmt.Errorf("atclient: modem returned ERROR (sent: %s)", cmd)
 			case strings.HasPrefix(line, "+CME ERROR:"), strings.HasPrefix(line, "+CMS ERROR:"):
-				return nil, fmt.Errorf("atclient: modem returned %s", line)
+				return nil, fmt.Errorf("atclient: modem returned %s (sent: %s)", line, cmd)
 			case expectPrefix != "" && strings.HasPrefix(line, expectPrefix):
 				res.Value = unquote(strings.TrimSpace(strings.TrimPrefix(line, expectPrefix)))
 			case strings.HasPrefix(line, "+"):
@@ -145,7 +119,7 @@ new_method = r"""func (c *Client) execSingleCommand(cmd string, expectPrefix str
 	}
 }
 
-func normalizeCGLA(cmd string, realHandle string) (newCmd string, handle string, getRespCLA string, isCGLA bool) {
+func normalizeCGLA(cmd string) (newCmd string, handle string, getRespCLA string, isCGLA bool) {
 	upper := strings.ToUpper(cmd)
 	if !strings.HasPrefix(upper, "AT+CGLA=") {
 		return cmd, "", "", false
@@ -155,16 +129,13 @@ func normalizeCGLA(cmd string, realHandle string) (newCmd string, handle string,
 	if p1 < 0 {
 		return cmd, "", "", false
 	}
-	handle = unquote(strings.TrimSpace(rest[:p1]))
-	if realHandle != "" && !strings.EqualFold(handle, realHandle) {
-		handle = realHandle
-	}
+	handle = strings.ToUpper(unquote(strings.TrimSpace(rest[:p1])))
 	rest2 := rest[p1+1:]
 	p2 := strings.IndexByte(rest2, ',')
 	if p2 < 0 {
 		return cmd, "", "", false
 	}
-	apduHex := unquote(strings.TrimSpace(rest2[p2+1:]))
+	apduHex := strings.ToUpper(unquote(strings.TrimSpace(rest2[p2+1:])))
 	byteLen := len(apduHex) / 2
 	if byteLen > 5 {
 		if lc, err := strconv.ParseInt(apduHex[8:10], 16, 32); err == nil {
@@ -175,13 +146,16 @@ func normalizeCGLA(cmd string, realHandle string) (newCmd string, handle string,
 	}
 	if len(apduHex) >= 2 {
 		if claByte, err := strconv.ParseUint(apduHex[0:2], 16, 8); err == nil {
-			getRespCLA = fmt.Sprintf("%02x", claByte&0x03)
+			getRespCLA = fmt.Sprintf("%02X", claByte&0x03)
 		}
 	}
 	newCmd = fmt.Sprintf("AT+CGLA=%s,%d,\"%s\"", handle, len(apduHex), apduHex)
 	return newCmd, handle, getRespCLA, true
 }
 
+// CommandWithTimeout is Command with a per-call final-response timeout,
+// used for data commands (APDU execution) that may legitimately take
+// longer than control commands.
 func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout time.Duration) (*Result, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -193,35 +167,12 @@ func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout tim
 		return nil, fmt.Errorf("%w: %v", ErrDesynchronized, c.invalid)
 	}
 
-	upperCmd := strings.ToUpper(cmd)
-
-	if strings.HasPrefix(upperCmd, "AT+CCHO=") {
-		r, e := c.execSingleCommand(cmd, expectPrefix, timeout)
-		if e == nil && r != nil {
-			h := r.Value
-			if h == "" {
-				for _, u := range r.URCs {
-					if strings.HasPrefix(u, "+CCHO:") {
-						h = unquote(strings.TrimSpace(strings.TrimPrefix(u, "+CCHO:")))
-						break
-					}
-				}
-			}
-			c.realHandle = h
-		}
-		return r, e
+	if strings.HasPrefix(strings.ToUpper(cmd), "AT+CCHO=") {
+		cmd = strings.ToUpper(cmd)
+		return c.execSingleCommand(cmd, expectPrefix, timeout)
 	}
 
-	if strings.HasPrefix(upperCmd, "AT+CCHC=") {
-		if c.realHandle != "" {
-			cmd = "AT+CCHC=" + c.realHandle
-		}
-		r, e := c.execSingleCommand(cmd, expectPrefix, timeout)
-		c.realHandle = ""
-		return r, e
-	}
-
-	fixedCmd, handle, getRespCLA, isCGLA := normalizeCGLA(cmd, c.realHandle)
+	fixedCmd, handle, getRespCLA, isCGLA := normalizeCGLA(cmd)
 	if !isCGLA {
 		return c.execSingleCommand(cmd, expectPrefix, timeout)
 	}
@@ -249,7 +200,7 @@ func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout tim
 
 		if sw1 == "61" && getRespCLA != "" {
 			got61 = true
-			getRespAPDU := fmt.Sprintf("%sc00000%s", getRespCLA, strings.ToLower(sw2))
+			getRespAPDU := fmt.Sprintf("%sC00000%s", getRespCLA, sw2)
 			nextCmd := fmt.Sprintf("AT+CGLA=%s,10,\"%s\"", handle, getRespAPDU)
 			nextRes, nextErr := c.execSingleCommand(nextCmd, expectPrefix, timeout)
 			if nextErr != nil {
@@ -278,4 +229,4 @@ src = src.replace(old_method, new_method, 1)
 with open(target, "w", encoding="utf-8") as f:
     f.write(src)
 
-print("Patch selesai diterapkan.")
+print("Patch UPPERCASE + Le=00 + GET RESPONSE selesai diterapkan.")
