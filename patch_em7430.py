@@ -1,9 +1,40 @@
+import shutil
+
 target = "internal/atclient/atclient.go"
+shutil.copyfile(target, target + ".bak")
 
 with open(target, "r", encoding="utf-8") as f:
     src = f.read()
 
-old_method = """// CommandWithTimeout is Command with a per-call final-response timeout,
+# 1. Tambah field realHandle di struct Client
+old_struct = r"""type Client struct {
+	port Port
+	opts Options
+
+	mu     sync.Mutex
+	buf    []byte
+	closed bool
+	// invalid marks the stream unusable; reason keeps the cause.
+	invalid error
+}"""
+
+new_struct = r"""type Client struct {
+	port Port
+	opts Options
+
+	mu         sync.Mutex
+	buf        []byte
+	closed     bool
+	realHandle string
+	// invalid marks the stream unusable; reason keeps the cause.
+	invalid error
+}"""
+
+assert old_struct in src, "Blok struct Client tidak cocok! Cek spasi/indentasi di atclient.go"
+src = src.replace(old_struct, new_struct, 1)
+
+# 2. Ganti CommandWithTimeout
+old_method = r"""// CommandWithTimeout is Command with a per-call final-response timeout,
 // used for data commands (APDU execution) that may legitimately take
 // longer than control commands.
 func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout time.Duration) (*Result, error) {
@@ -17,7 +48,7 @@ func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout tim
 		return nil, fmt.Errorf("%w: %v", ErrDesynchronized, c.invalid)
 	}
 
-	if _, err := c.port.Write([]byte(cmd + "\\r")); err != nil {
+	if _, err := c.port.Write([]byte(cmd + "\r")); err != nil {
 		return c.fail("write: %v", err)
 	}
 
@@ -68,8 +99,8 @@ func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout tim
 	}
 }"""
 
-new_method = """func (c *Client) execSingleCommand(cmd string, expectPrefix string, timeout time.Duration) (*Result, error) {
-	if _, err := c.port.Write([]byte(cmd + "\\r")); err != nil {
+new_method = r"""func (c *Client) execSingleCommand(cmd string, expectPrefix string, timeout time.Duration) (*Result, error) {
+	if _, err := c.port.Write([]byte(cmd + "\r")); err != nil {
 		return c.fail("write: %v", err)
 	}
 
@@ -119,7 +150,10 @@ new_method = """func (c *Client) execSingleCommand(cmd string, expectPrefix stri
 	}
 }
 
-func normalizeCGLA(cmd string) (newCmd string, handle string, getRespCLA string, isCGLA bool) {
+// normalizeCGLA menyiapkan AT+CGLA untuk modem yang butuh byte Le pada APDU
+// Case 4 dan session ID panjang. realHandle (jika ada) menggantikan handle
+// apa pun yang dikirim lapisan atas.
+func normalizeCGLA(cmd string, realHandle string) (newCmd string, handle string, getRespCLA string, isCGLA bool) {
 	upper := strings.ToUpper(cmd)
 	if !strings.HasPrefix(upper, "AT+CGLA=") {
 		return cmd, "", "", false
@@ -129,7 +163,10 @@ func normalizeCGLA(cmd string) (newCmd string, handle string, getRespCLA string,
 	if p1 < 0 {
 		return cmd, "", "", false
 	}
-	handle = strings.TrimSpace(rest[:p1])
+	handle = unquote(strings.TrimSpace(rest[:p1]))
+	if realHandle != "" && !strings.EqualFold(handle, realHandle) {
+		handle = realHandle
+	}
 	rest2 := rest[p1+1:]
 	p2 := strings.IndexByte(rest2, ',')
 	if p2 < 0 {
@@ -149,10 +186,13 @@ func normalizeCGLA(cmd string) (newCmd string, handle string, getRespCLA string,
 			getRespCLA = fmt.Sprintf("%02x", claByte&0x03)
 		}
 	}
-	newCmd = fmt.Sprintf("AT+CGLA=%s,%d,\\"%s\\"", handle, len(apduHex), apduHex)
+	newCmd = fmt.Sprintf("AT+CGLA=%s,%d,\"%s\"", handle, len(apduHex), apduHex)
 	return newCmd, handle, getRespCLA, true
 }
 
+// CommandWithTimeout is Command with a per-call final-response timeout,
+// used for data commands (APDU execution) that may legitimately take
+// longer than control commands.
 func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout time.Duration) (*Result, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -164,7 +204,37 @@ func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout tim
 		return nil, fmt.Errorf("%w: %v", ErrDesynchronized, c.invalid)
 	}
 
-	fixedCmd, handle, getRespCLA, isCGLA := normalizeCGLA(cmd)
+	upperCmd := strings.ToUpper(cmd)
+
+	// CCHO: simpan session ID asli dari modem, balasan tidak diubah.
+	if strings.HasPrefix(upperCmd, "AT+CCHO=") {
+		r, e := c.execSingleCommand(cmd, expectPrefix, timeout)
+		if e == nil && r != nil {
+			h := r.Value
+			if h == "" {
+				for _, u := range r.URCs {
+					if strings.HasPrefix(u, "+CCHO:") {
+						h = unquote(strings.TrimSpace(strings.TrimPrefix(u, "+CCHO:")))
+						break
+					}
+				}
+			}
+			c.realHandle = h
+		}
+		return r, e
+	}
+
+	// CCHC: pakai session ID asli, lalu lupakan.
+	if strings.HasPrefix(upperCmd, "AT+CCHC=") {
+		if c.realHandle != "" {
+			cmd = "AT+CCHC=" + c.realHandle
+		}
+		r, e := c.execSingleCommand(cmd, expectPrefix, timeout)
+		c.realHandle = ""
+		return r, e
+	}
+
+	fixedCmd, handle, getRespCLA, isCGLA := normalizeCGLA(cmd, c.realHandle)
 	if !isCGLA {
 		return c.execSingleCommand(cmd, expectPrefix, timeout)
 	}
@@ -191,7 +261,7 @@ func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout tim
 
 		if sw1 == "61" && getRespCLA != "" {
 			getRespAPDU := fmt.Sprintf("%sc00000%s", getRespCLA, strings.ToLower(sw2))
-			nextCmd := fmt.Sprintf("AT+CGLA=%s,10,\\"%s\\"", handle, getRespAPDU)
+			nextCmd := fmt.Sprintf("AT+CGLA=%s,10,\"%s\"", handle, getRespAPDU)
 			nextRes, nextErr := c.execSingleCommand(nextCmd, expectPrefix, timeout)
 			if nextErr != nil {
 				return nextRes, nextErr
@@ -202,13 +272,13 @@ func (c *Client) CommandWithTimeout(cmd string, expectPrefix string, timeout tim
 			fullData.WriteString(sw1)
 			fullData.WriteString(sw2)
 			combined := fullData.String()
-			curRes.Value = fmt.Sprintf("%d,\\"%s\\"", len(combined), combined)
+			curRes.Value = fmt.Sprintf("%d,\"%s\"", len(combined), combined)
 			return curRes, nil
 		}
 	}
 }"""
 
-assert old_method in src, "Blok CommandWithTimeout tidak cocok!"
+assert old_method in src, "Blok CommandWithTimeout tidak cocok! File mungkin sudah dipatch atau berbeda versi."
 if '"strconv"' not in src:
     src = src.replace('"strings"', '"strconv"\n\t"strings"', 1)
 src = src.replace(old_method, new_method, 1)
@@ -216,4 +286,4 @@ src = src.replace(old_method, new_method, 1)
 with open(target, "w", encoding="utf-8") as f:
     f.write(src)
 
-print("Patch ISO 7816-4 / Sierra EM7430 selesai diterapkan.")
+print("Patch selesai. Backup ada di", target + ".bak")
