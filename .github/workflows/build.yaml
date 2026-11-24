@@ -58,13 +58,9 @@ jobs:
       - name: Version
         id: version
         run: |
-          if [ "$GITHUB_REF_TYPE" = tag ]; then
-            VERSION=$(EASYLPAC_VERSION="$GITHUB_REF_NAME" ./scripts/version.sh)
-          else
-            VERSION=$(./scripts/version.sh)
-          fi
-          echo "version: $VERSION"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+         VERSION="0.9.3-em7430"
+         echo "version: $VERSION"
+         echo "version=$VERSION" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
